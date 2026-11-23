@@ -1,6 +1,6 @@
 ---
 name: "Golang Backend Style"
-description: "Write and edit Go backend code in a layered, opinionated idiom — chi + pgx + raw SQL, sentinel errors, a normalize/validate split, and table-driven tests. Use it whenever a Go service follows, or should follow, this architecture: new endpoints, handlers, repository functions, models, middlewares, schema, or tests."
+description: "Write and edit Go backend code in a layered, opinionated idiom — chi + raw SQL over pgx or modernc.org/sqlite, sentinel errors, a normalize/validate split, and table-driven tests. Use it whenever a Go service follows, or should follow, this architecture: new endpoints, handlers, repository functions, models, middlewares, schema, or tests."
 ---
 
 # Go Backend Style Guide
@@ -24,7 +24,9 @@ All **code, comments, and error messages are written in English.**
 The idiom assumes this toolchain; substitute only with good reason:
 
 - Routing: `go-chi/chi/v5`
-- Database: `jackc/pgx/v5` through a global `pgxpool`
+- Database: PostgreSQL through `jackc/pgx/v5` (global `pgxpool`) or
+  SQLite through `modernc.org/sqlite` (`database/sql`); the store
+  package is the only place that knows which
 - Auth: `golang-jwt/jwt/v5` (HS256) + `golang.org/x/crypto/bcrypt`
 - Config: environment variables loaded with `joho/godotenv`
 - Tests: stdlib `testing` + `httptest`; database-backed tests behind
@@ -57,7 +59,7 @@ The idiom assumes this toolchain; substitute only with good reason:
 ```
 internal/
 ├── config/        → environment variables (dotenv file, GetEnv)
-├── store/         → pgxpool connection (global DB), schema bootstrap, shared pgx helpers
+├── store/         → database pool/handle (global DB), schema bootstrap, driver-error helpers
 ├── models/        → JSON request/response types, JWT claims. No logic.
 ├── repository/    → SQL queries, sentinel errors. Never sees HTTP.
 ├── handlers/      → router.go + per-domain packages
@@ -318,10 +320,11 @@ Fixed conventions:
   builders.
 - Parameters are `$1, $2, ...` and **each argument sits on its own
   line** at the call.
-- `errors.Is(err, pgx.ErrNoRows)` → the not-found sentinel;
-  `store.IsUniqueErr(err)` → the "already exists" sentinel. Never
-  hardcode the `23505` SQLSTATE yourself — use the shared helper in
-  the store package.
+- Route driver errors through the store package: the driver's
+  no-rows sentinel (`pgx.ErrNoRows` on PostgreSQL, `sql.ErrNoRows`
+  on SQLite) maps to the not-found sentinel; `store.IsUniqueErr`
+  maps to the "already exists" sentinel. Never hardcode SQLSTATE or
+  SQLite result codes in the repository.
 - After `Exec`, `RowsAffected() == 0` → the "not found" sentinel.
 - Access control happens inside the query: `SELECT EXISTS(...)` or
   several `EXISTS/COALESCE` columns resolved in one `SELECT` — e.g.
@@ -332,6 +335,26 @@ Fixed conventions:
 - Wrapping format: `fmt.Errorf("repository: <action>: %w", err)`. The
   prefix matches the package: `repository:`, `store:`, `config:`,
   `auth:`.
+
+### Dialects: PostgreSQL and SQLite
+
+The same skeleton carries both drivers; only the placeholder style,
+the call surface, and the DDL differ:
+
+| | PostgreSQL (`jackc/pgx/v5`) | SQLite (`modernc.org/sqlite`) |
+| --- | --- | --- |
+| Handle | `*pgxpool.Pool` | `*sql.DB` |
+| Calls | `QueryRow(ctx, ...)`, `Exec(ctx, ...)` | `QueryRowContext(ctx, ...)`, `ExecContext(ctx, ...)` |
+| Placeholders | `$1, $2, ...` | `?` per argument |
+| No rows | `pgx.ErrNoRows` | `sql.ErrNoRows` |
+| Unique violation | SQLSTATE `23505` in `*pgconn.PgError` | result code `2067` (`SQLITE_CONSTRAINT_UNIQUE`) in `*sqlite.Error` |
+| Booleans | native `BOOLEAN` | `INTEGER` `0`/`1` |
+| Transactions | `Begin(ctx)`, `tx.Rollback(ctx)`, `tx.Commit(ctx)` | `BeginTx(ctx, nil)`, `tx.Rollback()`, `tx.Commit()` |
+
+Both drivers support `EXISTS(...)` access checks, `DELETE ...
+RETURNING`, partial unique indexes, and `ON DELETE CASCADE` — so
+repository code stays shaped identically. Register the SQLite driver
+with a blank import: `_ "modernc.org/sqlite"`.
 
 Transactions, for operations that perform multiple writes:
 
@@ -453,22 +476,53 @@ handlers may lack it; keep the suffix in new code).
 
 ## Store / schema
 
-- `store.DB *pgxpool.Pool` is global; `ConnectDatabase` connects,
-  pings, and on failure closes the pool and leaves `DB = nil`.
+- `store.DB` is global — a `*pgxpool.Pool` on PostgreSQL, a
+  `*sql.DB` on SQLite; `ConnectDatabase` connects, pings, and on
+  failure closes the handle and leaves `DB = nil`.
+- On SQLite, the DSN must enable the pragmas the SQL relies on:
+  `file:app.db?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)`.
+  Foreign keys are OFF by default in SQLite — without the pragma,
+  `ON DELETE CASCADE` is a no-op. `journal_mode(WAL)` helps
+  read-heavy concurrent services.
 - The schema bootstrap runs on every startup: everything is `CREATE
-  TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS` / `ALTER TABLE
-  ... ADD COLUMN IF NOT EXISTS`. Existing tables are never rewritten;
-  when a column must be backfilled into older databases, add it as
-  nullable (NOT NULL cannot be enforced on pre-existing rows) and
-  enforce uniqueness with a separate index — justify the patch in a
-  comment above the SQL.
-- Schema conventions: `id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY
-  KEY`, `TIMESTAMPTZ NOT NULL DEFAULT NOW()`, foreign keys with
-  `REFERENCES ...(id) ON DELETE CASCADE`, pairs with `UNIQUE (a, b)`,
-  conditional uniqueness via a partial unique index
-  (`WHERE status = 'pending'`).
-- Reusable pgx helpers live in one place (like `IsUniqueErr`); the
-  SQLSTATE code lives in exactly one named constant.
+  TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`. Existing
+  tables are never rewritten; when a column must be backfilled into
+  older databases, add it as nullable (NOT NULL cannot be enforced on
+  pre-existing rows) and enforce uniqueness with a separate index —
+  justify the patch in a comment above the SQL. SQLite has no
+  `ADD COLUMN IF NOT EXISTS`: guard such patches with a
+  `PRAGMA table_info` existence check.
+- Schema conventions per dialect:
+  - PostgreSQL: `id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY`,
+    `TIMESTAMPTZ NOT NULL DEFAULT NOW()`.
+  - SQLite: `id INTEGER PRIMARY KEY AUTOINCREMENT`, timestamps as
+    RFC 3339 `TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ',
+    'now'))`, scanned as a string and parsed after `Scan`.
+  - Both: foreign keys with `REFERENCES ...(id) ON DELETE CASCADE`,
+    pairs with `UNIQUE (a, b)`, conditional uniqueness via a partial
+    unique index (`WHERE status = 'pending'`).
+- Driver-error helpers live in one place and cover both drivers; each
+  raw code lives in exactly one named constant:
+
+```go
+// IsUniqueErr reports whether err is, or wraps, a unique constraint
+// violation from either supported driver. Callers use it to turn
+// duplicate-key failures into user-facing errors instead of
+// treating them as internal failures.
+func IsUniqueErr(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == uniqueViolation // 23505
+	}
+
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		return sqliteErr.Code() == sqliteConstraintUnique // 2067
+	}
+
+	return false
+}
+```
 
 ## Middleware / context
 
@@ -530,8 +584,8 @@ func TestValidateThingReq(t *testing.T) {
 ```go
 //go:build integration
 
-// End-to-end tests for the thing handlers backed by a real PostgreSQL
-// instance. Run them with:
+// End-to-end tests for the thing handlers backed by a real database
+// (PostgreSQL or SQLite). Run them with:
 //
 //	TEST_DATABASE_URL=postgres://user:pass@localhost/myapp_test \
 //		go test -tags=integration ./...
@@ -585,6 +639,8 @@ go test ./...
 
 # integration (when a database is available):
 TEST_DATABASE_URL=postgres://... go test -tags=integration ./...
+# or SQLite:
+TEST_DATABASE_URL=file:./test.db?_pragma=foreign_keys(1) go test -tags=integration ./...
 ```
 
 Before finishing, also verify: does every exported identifier have a

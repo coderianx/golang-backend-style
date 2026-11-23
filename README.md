@@ -4,10 +4,11 @@
 
 An agent skill that teaches AI coding agents to write Go backend code
 in a complete, opinionated idiom: a layered `internal/` architecture,
-raw SQL over pgx, strict sentinel-error discipline, a fixed
-normalize/validate flow, a distinctive vertical code format, and
-table-driven tests — distilled from a production code base and
-generalized so any service can adopt it.
+raw SQL over pgx (PostgreSQL) or modernc.org/sqlite (SQLite), strict
+sentinel-error discipline, a fixed normalize/validate flow, a
+distinctive vertical code format, and table-driven tests — distilled
+from a production code base and generalized so any service can adopt
+it.
 
 ## Install
 
@@ -60,7 +61,8 @@ Without the CLI, copy `SKILL.md` into your agent's skills folder as
 
 ## What it covers
 
-- **Stack**: chi routing, pgx/v5 through a global pool, JWT (HS256) +
+- **Stack**: chi routing, raw SQL through a global pool or handle —
+  pgx/v5 (PostgreSQL) or modernc.org/sqlite (SQLite) — JWT (HS256) +
   bcrypt auth, godotenv config, stdlib testing.
 - **Architecture**: one-way layering `handlers → repository → store`;
   per-domain handler packages with a `handlers.go` / `helpers.go`
