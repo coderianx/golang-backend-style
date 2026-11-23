@@ -1,6 +1,6 @@
 ---
-name: Golang Backend Style
-description: Write and edit Go backend code in a layered, opinionated idiom — chi + pgx + raw SQL, sentinel errors, a normalize/validate split, and table-driven tests. Use it whenever a Go service follows, or should follow, this architecture: new endpoints, handlers, repository functions, models, middlewares, schema, or tests.
+name: "Golang Backend Style"
+description: "Write and edit Go backend code in a layered, opinionated idiom — chi + pgx + raw SQL, sentinel errors, a normalize/validate split, and table-driven tests. Use it whenever a Go service follows, or should follow, this architecture: new endpoints, handlers, repository functions, models, middlewares, schema, or tests."
 ---
 
 # Go Backend Style Guide
